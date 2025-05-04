@@ -16,7 +16,8 @@ PAGE_SIZE = 100
 
 # Mapping Notion property names (as defined in your DB) to code variables
 # IMPORTANT: Adjust these if your Notion property names are different!
-PROP_REPO_ID = "GitHub Repo ID" # MUST match the Text property name for storing 'owner/repo'
+PROP_REPO_ID = "GitHub Repo ID" # MUST match the Text property name for storing repo ID
+PROP_FULL_NAME = "Full Name"    # Added property for storing 'owner/repo'
 PROP_NAME = "Name"             # MUST match the Title property name
 PROP_DESCRIPTION = "Description"
 PROP_URL = "URL"
@@ -89,6 +90,19 @@ class NotionClient:
 
         logger.info(f"Querying Notion database {self._database_id}...")
 
+        # 首先检查并获取数据库结构，确认属性存在情况
+        try:
+            db_url = f"{NOTION_API_BASE_URL}/databases/{self._database_id}"
+            db_info = self._make_request("GET", db_url)
+            db_properties = db_info.get("properties", {}).keys()
+            has_full_name = PROP_FULL_NAME in db_properties
+            
+            if not has_full_name:
+                logger.warning(f"数据库中不存在 '{PROP_FULL_NAME}' 属性，将不使用此属性进行匹配")
+        except Exception as e:
+            logger.warning(f"获取数据库结构失败: {e}，将假设所有属性都存在")
+            has_full_name = True
+
         while has_more:
             payload = {"page_size": PAGE_SIZE}
             if start_cursor:
@@ -101,23 +115,46 @@ class NotionClient:
                 for page in response_data.get("results", []):
                     page_id = page.get("id")
                     properties = page.get("properties", {})
+                    
+                    # 获取存储在 Repo ID 字段中的值
                     repo_id_prop = properties.get(PROP_REPO_ID, {}).get("rich_text", [])
-                    # Extract the plain text from the rich text array
+                    
+                    # 尝试获取全名字段（如果存在）
+                    full_name = None
+                    if has_full_name:
+                        full_name_prop = properties.get(PROP_FULL_NAME, {}).get("rich_text", [])
+                        full_name = full_name_prop[0].get("plain_text") if full_name_prop else None
+                    
                     if repo_id_prop:
                         repo_id = repo_id_prop[0].get("plain_text")
                         if repo_id and page_id:
-                            pages_map[repo_id] = page_id
+                            # 1. 如果 repo_id 是数字，用数字 ID 作为键
+                            if repo_id.isdigit():
+                                pages_map[repo_id] = page_id
+                                logger.debug(f"使用数字 ID {repo_id} 作为键")
+                            # 2. 否则，如果看起来像 owner/repo 格式，作为全名处理
+                            elif "/" in repo_id:
+                                # 使用特殊前缀标记这是全名
+                                pages_map[f"name:{repo_id}"] = page_id
+                                logger.debug(f"使用全名格式 ID '{repo_id}' 作为键")
+                            # 3. 其他情况记录警告但仍将其添加到映射中
+                            else:
+                                pages_map[f"unknown:{repo_id}"] = page_id
+                                logger.warning(f"页面 {page_id} 的 Repo ID '{repo_id}' 格式未知")
                         else:
                             logger.warning(f"Found page without valid Repo ID or Page ID: Page data: {page}")
+                    # 4. 如果没有 Repo ID 但有 Full Name，使用 Full Name
+                    elif full_name:
+                        pages_map[f"name:{full_name}"] = page_id
+                        logger.debug(f"使用 Full Name {full_name} 作为键")
                     else:
-                         logger.warning(f"Found page missing expected '{PROP_REPO_ID}' property or it's empty: Page ID {page_id}")
+                        logger.warning(f"Found page missing both '{PROP_REPO_ID}' and '{PROP_FULL_NAME}' properties: Page ID {page_id}")
 
                 has_more = response_data.get("has_more", False)
                 start_cursor = response_data.get("next_cursor")
 
             except (RequestException, ValueError, KeyError) as e:
                 logger.error(f"Failed to query or parse Notion database: {e}")
-                # Depending on requirements, might return partial results or raise
                 break # Stop querying on error
             except Exception as e:
                 logger.exception(f"An unexpected error occurred during Notion DB query: {e}")
@@ -130,10 +167,18 @@ class NotionClient:
         """Helper to build the Notion properties payload from repo data."""
         properties = {
             PROP_NAME: {"title": [{"text": {"content": repo_data["name"]}}]}, # Title needs specific format
-            PROP_REPO_ID: {"rich_text": [{"text": {"content": repo_data["full_name"]}}]}, # Use full_name as the unique ID
+            PROP_REPO_ID: {"rich_text": [{"text": {"content": str(repo_data["id"])}}]}, # Use numeric ID as the unique ID
             PROP_URL: {"rich_text": [{"text": {"content": repo_data["url"]}}]},  # Changed to rich_text type
             PROP_STARS: {"number": repo_data["stars"]}
         }
+        
+        # 只有在定义了 PROP_FULL_NAME 且不是默认值时才添加
+        if PROP_FULL_NAME != "Full Name":  # 默认值检查
+            try:
+                properties[PROP_FULL_NAME] = {"rich_text": [{"text": {"content": repo_data["full_name"]}}]}
+            except Exception as e:
+                logger.warning(f"Failed to set Full Name property: {e}. This is expected if the property doesn't exist in the database.")
+        
         # Handle optional fields
         if repo_data.get("description"): # Check if description exists and is not None/empty
             # Truncate description if it exceeds Notion's limit (2000 characters for text)
@@ -285,25 +330,83 @@ class NotionClient:
     def get_page(self, page_id):
         """获取页面数据"""
         try:
-            response = self._make_request(f"pages/{page_id}")
+            # 获取页面数据
+            url = f"{NOTION_API_BASE_URL}/pages/{page_id}"
+            response = self._make_request("GET", url)
+            
             if response and response.get("properties"):
                 props = response["properties"]
-                return {
-                    "repo_id": self._get_rich_text_content(props.get("Repository ID")),
-                    "name": self._get_title_content(props.get("Name")),
-                    "full_name": self._get_rich_text_content(props.get("Full Name")),
-                    "description": self._get_rich_text_content(props.get("Description")),
-                    "url": props.get("URL", {}).get("url", ""),
-                    "language": self._get_rich_text_content(props.get("Language")),
-                    "stars": props.get("Stars", {}).get("number", 0),
-                    "topics": [item["name"] for item in props.get("Topics", {}).get("multi_select", [])],
-                    "last_updated": props.get("Last Updated", {}).get("date", {}).get("start", ""),
-                    "starred_at": props.get("Starred At", {}).get("date", {}).get("start", "")  # 添加 starred_at 字段
+                page_data = {
+                    "repo_id": self._get_property_text(props.get("Repository ID")),
+                    "name": self._get_property_title(props.get("Name")),
+                    "description": self._get_property_text(props.get("Description")),
+                    "language": self._get_property_select(props.get("Language")),
+                    "stars": self._get_property_number(props.get("Stars")),
+                    "topics": self._get_property_multi_select(props.get("Topics")),
+                    "last_updated": self._get_property_date(props.get("Last Updated")),
+                    "starred_at": self._get_property_date(props.get("Starred At"))
                 }
+                
+                # 只有在属性存在时才尝试获取 Full Name
+                if PROP_FULL_NAME in props:
+                    page_data["full_name"] = self._get_property_text(props.get(PROP_FULL_NAME))
+                
+                return page_data
+            
+            logger.warning(f"获取页面 {page_id} 的数据为空或格式不正确")
             return None
         except Exception as e:
             logger.error(f"获取页面失败 (ID: {page_id}): {e}")
             return None
+    
+    def _get_property_text(self, prop):
+        """从富文本属性中提取文本内容"""
+        if not prop:
+            return ""
+        rich_text = prop.get("rich_text", [])
+        if rich_text:
+            return rich_text[0].get("plain_text", "")
+        return ""
+    
+    def _get_property_title(self, prop):
+        """从标题属性中提取文本内容"""
+        if not prop:
+            return ""
+        title = prop.get("title", [])
+        if title:
+            return title[0].get("text", {}).get("content", "")
+        return ""
+    
+    def _get_property_select(self, prop):
+        """从选择属性中提取选项名称"""
+        if not prop:
+            return ""
+        select = prop.get("select")
+        if select:
+            return select.get("name", "")
+        return ""
+    
+    def _get_property_multi_select(self, prop):
+        """从多选属性中提取选项名称列表"""
+        if not prop:
+            return []
+        multi_select = prop.get("multi_select", [])
+        return [item.get("name", "") for item in multi_select]
+    
+    def _get_property_number(self, prop):
+        """从数字属性中提取数值"""
+        if not prop:
+            return 0
+        return prop.get("number", 0)
+    
+    def _get_property_date(self, prop):
+        """从日期属性中提取起始日期"""
+        if not prop:
+            return ""
+        date = prop.get("date")
+        if date:
+            return date.get("start", "")
+        return ""
 
 # Example usage (requires a valid .env file)
 if __name__ == '__main__':
